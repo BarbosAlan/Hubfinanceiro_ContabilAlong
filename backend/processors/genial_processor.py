@@ -174,14 +174,11 @@ def process_genial_excel(
                 "HISTORICO DE LANÇAMENTO": txt_l
             })
 
-    # Linhas sem palavras-chave: HISTORICO = detalhe original + categoria, LANÇAMENTO vazio
+    # Linhas sem palavras-chave: mantém HISTORICO original, LANÇAMENTO vazio
     for _, row in df_others.iterrows():
-        detalhe = str(row["HISTORICO DE LANÇAMENTO"]).strip()
-        categoria = str(row["HISTORICO"]).strip()
-        historico_completo = detalhe + categoria if detalhe else categoria
         resultados.append({
             "Data": row["Data"],
-            "HISTORICO": historico_completo,
+            "HISTORICO": row["HISTORICO"],
             "Valor": row["Valor"],
             "HISTORICO DE LANÇAMENTO": ""
         })
