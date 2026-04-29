@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import io
+import os
+import pathlib
 import zipfile
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -12,11 +14,18 @@ from processors.ip_processor import process_csv_content, ProcessOptions
 
 app = FastAPI(title="Contabil Along Hub API", version="2.0.0")
 
+MAX_CSV_SIZE  = 10 * 1024 * 1024  # 10 MB
+MAX_XLSX_SIZE = 20 * 1024 * 1024  # 20 MB
+
+# Defina ALLOWED_ORIGIN no Render com a URL do Vercel para restringir acesso
+_raw_origins = os.getenv("ALLOWED_ORIGIN", "*")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -28,15 +37,20 @@ def health_check():
 
 @app.post("/api/ip/process")
 async def process_ip(files: list[UploadFile] = File(...)):
-    csv_files = [f for f in files if f.filename.endswith(".csv")]
+    csv_files = [f for f in files if f.filename and f.filename.endswith(".csv")]
 
     if not csv_files:
         raise HTTPException(status_code=400, detail="Nenhum arquivo .csv enviado.")
 
-    # Lê todos os arquivos em paralelo (I/O bound)
     contents = await asyncio.gather(*[uf.read() for uf in csv_files])
 
+    for uf, content in zip(csv_files, contents):
+        if len(content) > MAX_CSV_SIZE:
+            safe = pathlib.Path(uf.filename).name
+            raise HTTPException(status_code=413, detail=f"Arquivo '{safe}' excede o limite de 10 MB.")
+
     async def _process_one(content_bytes: bytes, filename: str) -> dict:
+        safe_name = pathlib.Path(filename).name
         try:
             result = await asyncio.to_thread(
                 process_csv_content,
@@ -45,24 +59,23 @@ async def process_ip(files: list[UploadFile] = File(...)):
                 options=ProcessOptions(statuses={"Completed"}, preview_rows=50),
             )
             return {
-                "name": filename,
+                "name": safe_name,
                 "output_base64": base64.b64encode(result["output_bytes"]).decode("utf-8"),
                 "errors_base64": base64.b64encode(result["errors_bytes"]).decode("utf-8") if result["errors_bytes"] else None,
                 "metrics": result["metrics"],
                 "warnings": result["warnings"],
                 "preview": result["preview"],
             }
-        except Exception as e:
-            return {"_error": True, "filename": filename, "error": str(e)}
+        except Exception:
+            return {"_error": True, "filename": safe_name, "error": "Erro ao processar arquivo."}
 
-    # Processa todos os arquivos em paralelo (CPU via thread pool)
     raw = await asyncio.gather(*[_process_one(c, f.filename) for f, c in zip(csv_files, contents)])
 
     results = [r for r in raw if not r.get("_error")]
-    errors = [{"filename": r["filename"], "error": r["error"]} for r in raw if r.get("_error")]
+    errors  = [{"filename": r["filename"], "error": r["error"]} for r in raw if r.get("_error")]
 
     if not results and errors:
-        raise HTTPException(status_code=400, detail="Nenhum arquivo processado. Erros: " + str(errors))
+        raise HTTPException(status_code=400, detail="Nenhum arquivo processado com sucesso.")
 
     all_zip_base64 = None
     if len(results) > 1:
@@ -78,10 +91,15 @@ async def process_ip(files: list[UploadFile] = File(...)):
 
 @app.post("/api/genial/process")
 async def process_genial(file: UploadFile = File(...)):
-    if not file.filename.endswith(".xlsx"):
+    if not file.filename or not file.filename.endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Arquivo deve ser .xlsx")
 
     content_bytes = await file.read()
+
+    if len(content_bytes) > MAX_XLSX_SIZE:
+        raise HTTPException(status_code=413, detail="Arquivo excede o limite de 20 MB.")
+
+    safe_name = pathlib.Path(file.filename).name
     targets = GenialTargets().all
 
     try:
@@ -95,10 +113,12 @@ async def process_genial(file: UploadFile = File(...)):
         preview = df_preview.head(25).to_dict(orient="records")
 
         return JSONResponse(content={
-            "filename": file.filename.replace(".xlsx", "_tratado.xlsx"),
+            "filename": safe_name.replace(".xlsx", "_tratado.xlsx"),
             "output_base64": base64.b64encode(excel_output).decode("utf-8"),
             "stats": stats,
             "preview": preview,
         })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro ao processar o extrato.")
