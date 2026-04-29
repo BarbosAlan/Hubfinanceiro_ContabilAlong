@@ -174,14 +174,13 @@ def process_genial_excel(
                 "HISTORICO DE LANÇAMENTO": txt_l
             })
 
-    # Adiciona as linhas que não foram agrupadas (Garantindo que Lançamento = Histórico)
+    # Adiciona as linhas que não foram agrupadas preservando o HISTORICO DE LANÇAMENTO original
     for _, row in df_others.iterrows():
-        # ✅ Para linhas individuais, mantemos a mesma coisa em ambas as colunas
         resultados.append({
             "Data": row["Data"],
             "HISTORICO": row["HISTORICO"],
             "Valor": row["Valor"],
-            "HISTORICO DE LANÇAMENTO": row["HISTORICO"]
+            "HISTORICO DE LANÇAMENTO": row["HISTORICO DE LANÇAMENTO"]
         })
 
     if not resultados:
