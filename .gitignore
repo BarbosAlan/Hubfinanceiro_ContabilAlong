@@ -1,0 +1,28 @@
+# Dados financeiros e arquivos confidenciais
+*.csv
+*.xlsx
+*.xlsm
+*.xls
+*.pdf
+*.zip
+*.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+.venv/
+venv/
+env/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+frontend/.env*.local
+
+# Sistema
+.DS_Store
+Thumbs.db
