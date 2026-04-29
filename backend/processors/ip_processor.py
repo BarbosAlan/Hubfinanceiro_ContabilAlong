@@ -4,6 +4,8 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Optional
 
+import pandas as pd
+
 
 def fix_row(r: list[str]) -> list[str]:
     """Corrige linhas onde DestinationName contém vírgulas e foi quebrado em múltiplas colunas."""
@@ -13,43 +15,6 @@ def fix_row(r: list[str]) -> list[str]:
     suffix = r[-11:]
     dest_name = ",".join(r[9 : len(r) - 11])
     return prefix + [dest_name] + suffix
-
-
-def format_date(date_str: str) -> str:
-    """Converte 'DD-MM-YYYY HH:MM:SS' para 'DD/MM/YYYY'."""
-    if date_str and "-" in date_str:
-        parts = date_str.split(" ")[0]
-        d, m, y = parts.split("-")
-        return f"{d}/{m}/{y}"
-    return date_str
-
-
-def _parse_source_date(date_str: str) -> Optional[dt.date]:
-    if not date_str:
-        return None
-    try:
-        date_part = date_str.split(" ")[0]
-        d, m, y = date_part.split("-")
-        return dt.date(int(y), int(m), int(d))
-    except Exception:
-        return None
-
-
-def _parse_brl_number(value: str) -> Optional[float]:
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    s = s.replace("R$", "").strip()
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s and "." not in s:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
 
 
 def detect_encoding(content_bytes: bytes) -> str:
@@ -62,10 +27,38 @@ def detect_encoding(content_bytes: bytes) -> str:
 
 @dataclass(frozen=True)
 class ProcessOptions:
-    statuses: Optional[set[str]] = None  # ex: {'Completed'}
+    statuses: Optional[set[str]] = None
     date_start: Optional[dt.date] = None
     date_end: Optional[dt.date] = None
     preview_rows: int = 50
+
+
+def _parse_brl_series(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.strip()
+    s = s.str.replace(r"R\$\s*", "", regex=True).str.strip()
+    mask_both = s.str.contains(r"\.", regex=False) & s.str.contains(",")
+    s = s.copy()
+    s[mask_both] = s[mask_both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    mask_comma = ~mask_both & s.str.contains(",")
+    s[mask_comma] = s[mask_comma].str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _format_date(s: str) -> str:
+    if s and "-" in s:
+        part = s.split(" ")[0]
+        d, m, y = part.split("-")
+        return f"{d}/{m}/{y}"
+    return s
+
+
+def _parse_source_date(s: str) -> Optional[dt.date]:
+    try:
+        part = s.split(" ")[0]
+        d, m, y = part.split("-")
+        return dt.date(int(y), int(m), int(d))
+    except Exception:
+        return None
 
 
 def process_csv_content(
@@ -90,94 +83,112 @@ def process_csv_content(
         raise ValueError("CSV vazio.")
 
     if len(header) < 21:
-        raise ValueError(
-            f"Layout inesperado: cabeçalho com {len(header)} colunas (esperado >= 21)."
-        )
+        raise ValueError(f"Layout inesperado: cabeçalho com {len(header)} colunas (esperado >= 21).")
 
-    output = io.BytesIO()
-    wrapper = io.TextIOWrapper(output, encoding=output_encoding, errors="replace", newline="")
-    writer = csv.writer(wrapper, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
-    writer.writerow(["Data", "Valor", "Resumo da Transação"])
-
-    errors_output = io.BytesIO()
-    errors_wrapper = io.TextIOWrapper(
-        errors_output, encoding=output_encoding, errors="replace", newline=""
-    )
-    errors_writer = csv.writer(errors_wrapper, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
-    errors_writer.writerow(["Motivo", "LinhaOriginal"])
-
-    total_rows = 0
+    rows: list[list[str]] = []
+    error_rows: list[list[str]] = []
     linhas_problema = 0
     linhas_nao_corrigidas = 0
-    linhas_exportadas = 0
-    soma_valor = 0.0
-    soma_valor_ok = 0
-    preview: list[dict] = []
 
     for raw in reader:
-        total_rows += 1
         if len(raw) != 21:
             linhas_problema += 1
-
-        r = fix_row(raw)
-        if len(r) != 21:
-            linhas_nao_corrigidas += 1
-            errors_writer.writerow(["Nao foi possivel corrigir para 21 colunas", ",".join(raw)])
-            continue
-
-        status = (r[17] or "").strip()
-        if options.statuses is not None and status not in options.statuses:
-            continue
-
-        src_date = _parse_source_date(r[18])
-        if options.date_start and src_date and src_date < options.date_start:
-            continue
-        if options.date_end and src_date and src_date > options.date_end:
-            continue
-
-        data = format_date(r[18])
-        valor = r[20]
-        desc = r[2].upper() if r[2] else ""
-        tipo = r[19].upper()
-        origin_name = r[3].upper() if r[3] else ""
-        origin_acc = r[7]
-        dest_name = r[9].upper() if r[9] else ""
-        dest_acc = r[13]
-
-        if desc:
-            resumo = (
-                f"{desc} - TIPO: {tipo} DE R$ {valor} "
-                f"ORIGEM: {origin_name} (CONTA: {origin_acc}) "
-                f"P/ DESTINO: {dest_name} (CONTA: {dest_acc})"
-            )
+            fixed = fix_row(raw)
+            if len(fixed) != 21:
+                linhas_nao_corrigidas += 1
+                error_rows.append(["Nao foi possivel corrigir para 21 colunas", ",".join(raw)])
+                continue
+            rows.append(fixed)
         else:
-            resumo = (
-                f" - TIPO: {tipo} DE R$ {valor} "
-                f"ORIGEM: {origin_name} (CONTA: {origin_acc}) "
-                f"P/ DESTINO: {dest_name} (CONTA: {dest_acc})"
-            )
+            rows.append(raw)
 
-        resumo = resumo.encode(output_encoding, errors="replace").decode(output_encoding)
-        writer.writerow([data, valor, resumo])
-        linhas_exportadas += 1
+    total_rows = len(rows) + linhas_nao_corrigidas
 
-        v = _parse_brl_number(valor)
-        if v is not None:
-            soma_valor += v
-            soma_valor_ok += 1
+    _empty_result = {
+        "output_bytes": b"",
+        "errors_bytes": b"",
+        "detected_input_encoding": input_encoding,
+        "preview": [],
+        "metrics": {
+            "total_rows": total_rows,
+            "linhas_problema": linhas_problema,
+            "linhas_exportadas": 0,
+            "soma_valor": 0.0,
+            "soma_valor_ok": 0,
+        },
+        "warnings": {"linhas_nao_corrigidas": linhas_nao_corrigidas},
+    }
 
-        if len(preview) < options.preview_rows:
-            preview.append({"Data": data, "Valor": valor, "Resumo da Transação": resumo})
+    if not rows:
+        return _empty_result
 
-    wrapper.flush()
-    errors_wrapper.flush()
+    col = [f"c{i}" for i in range(21)]
+    df = pd.DataFrame(rows, columns=col)
 
-    errors_bytes = errors_output.getvalue()
-    if linhas_nao_corrigidas == 0:
-        errors_bytes = b""
+    # Filtro por status (coluna 17)
+    if options.statuses is not None:
+        df = df[df["c17"].str.strip().isin(options.statuses)]
+
+    # Filtro por data (coluna 18)
+    if (options.date_start or options.date_end) and not df.empty:
+        dates = df["c18"].apply(_parse_source_date)
+        if options.date_start:
+            df = df[dates.apply(lambda d: d is not None and d >= options.date_start)]
+        if options.date_end:
+            df = df[dates.apply(lambda d: d is not None and d <= options.date_end)]
+
+    if df.empty:
+        return _empty_result
+
+    # Colunas de saída
+    data_col = df["c18"].apply(_format_date)
+    valor_col = df["c20"].fillna("")
+
+    # Resumo vetorizado
+    desc = df["c2"].fillna("").str.upper()
+    tipo = df["c19"].fillna("").str.upper()
+    origin_name = df["c3"].fillna("").str.upper()
+    origin_acc = df["c7"].fillna("")
+    dest_name = df["c9"].fillna("").str.upper()
+    dest_acc = df["c13"].fillna("")
+
+    suffix = (
+        " - TIPO: " + tipo + " DE R$ " + valor_col
+        + " ORIGEM: " + origin_name + " (CONTA: " + origin_acc + ")"
+        + " P/ DESTINO: " + dest_name + " (CONTA: " + dest_acc + ")"
+    )
+    resumo_col = desc + suffix
+
+    df_out = pd.DataFrame({
+        "Data": data_col.values,
+        "Valor": valor_col.values,
+        "Resumo da Transação": resumo_col.values,
+    })
+
+    linhas_exportadas = len(df_out)
+
+    numeric_valores = _parse_brl_series(df_out["Valor"])
+    soma_valor = float(numeric_valores.sum(skipna=True))
+    soma_valor_ok = int(numeric_valores.notna().sum())
+
+    csv_str = df_out.to_csv(index=False, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+    output_bytes = csv_str.encode(output_encoding, errors="replace")
+
+    errors_bytes = b""
+    if error_rows:
+        buf = io.BytesIO()
+        wrapper = io.TextIOWrapper(buf, encoding=output_encoding, errors="replace", newline="")
+        w = csv.writer(wrapper, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+        w.writerow(["Motivo", "LinhaOriginal"])
+        for row in error_rows:
+            w.writerow(row)
+        wrapper.flush()
+        errors_bytes = buf.getvalue()
+
+    preview = df_out.head(options.preview_rows).to_dict(orient="records")
 
     return {
-        "output_bytes": output.getvalue(),
+        "output_bytes": output_bytes,
         "errors_bytes": errors_bytes,
         "detected_input_encoding": input_encoding,
         "preview": preview,
@@ -188,8 +199,5 @@ def process_csv_content(
             "soma_valor": soma_valor,
             "soma_valor_ok": soma_valor_ok,
         },
-        "warnings": {
-            "linhas_nao_corrigidas": linhas_nao_corrigidas,
-        },
+        "warnings": {"linhas_nao_corrigidas": linhas_nao_corrigidas},
     }
-
