@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import axios from 'axios';
-import { Upload, FileCheck, AlertCircle, Download, CreditCard, Table as TableIcon, Trash2, PieChart } from 'lucide-react';
+import { Upload, FileCheck, AlertCircle, Download, CreditCard, Table as TableIcon, PieChart } from 'lucide-react';
 import { API_URL } from '../config';
 
 const ExtratoGenial: React.FC = () => {
