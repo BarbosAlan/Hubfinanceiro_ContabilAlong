@@ -174,13 +174,13 @@ def process_genial_excel(
                 "HISTORICO DE LANÇAMENTO": txt_l
             })
 
-    # Linhas sem palavras-chave: mantém HISTORICO original, LANÇAMENTO vazio
+    # Linhas sem palavras-chave: mantém ambas as colunas com valor original do arquivo
     for _, row in df_others.iterrows():
         resultados.append({
             "Data": row["Data"],
             "HISTORICO": row["HISTORICO"],
             "Valor": row["Valor"],
-            "HISTORICO DE LANÇAMENTO": ""
+            "HISTORICO DE LANÇAMENTO": row["HISTORICO DE LANÇAMENTO"]
         })
 
     if not resultados:
