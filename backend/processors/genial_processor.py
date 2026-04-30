@@ -19,10 +19,12 @@ class GenialTargets:
     payin: str = "PAY IN"
     bloqueio: str = "BLOQUEIO"
     desbloqueio: str = "DESBLOQUEIO"
+    tarifa: str = "TARIFA"
+    lancamento_estorno: str = "LANÇAMENTO ESTORNO"
 
     @property
     def all(self) -> list[str]:
-        return [self.payout, self.payin, self.bloqueio, self.desbloqueio]
+        return [self.payout, self.payin, self.bloqueio, self.desbloqueio, self.tarifa, self.lancamento_estorno]
 
 
 REQUIRED_COLUMNS = ["Data", "HISTORICO", "Valor", "HISTORICO DE LANÇAMENTO"]
@@ -72,6 +74,14 @@ def classify_histórico(value: object, *, targets: GenialTargets | None = None) 
             return t.payout
         if "PAYIN" in s2 or ("PAY" in s and re.search(r"\bIN\b", s)):
             return t.payin
+
+    # tarifa / tarifas / abreviações: TARIF, TAR
+    if "TARIF" in s or re.search(r"\bTAR\b", s):
+        return t.tarifa
+
+    # lançamento estorno / estornos / abreviações: ESTORN, EST
+    if "ESTORN" in s or re.search(r"\bEST\b", s):
+        return t.lancamento_estorno
 
     return None
 
