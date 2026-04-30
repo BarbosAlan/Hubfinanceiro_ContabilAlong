@@ -80,7 +80,8 @@ def classify_histórico(value: object, *, targets: GenialTargets | None = None) 
         return t.tarifa
 
     # lançamento estorno / estornos / abreviações: ESTORN, EST
-    if "ESTORN" in s or re.search(r"\bEST\b", s):
+    # exclui estorno de fraude (mantido como linha normal)
+    if ("ESTORN" in s or re.search(r"\bEST\b", s)) and "FRAUD" not in s:
         return t.lancamento_estorno
 
     return None
