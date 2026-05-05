@@ -7,6 +7,8 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Optional
 
+import pandas as pd
+
 
 def fix_row(r: list[str], expected: int = 21) -> list[str]:
     """Corrige linhas onde DestinationName contém vírgulas e foi quebrado em múltiplas colunas."""
@@ -35,28 +37,6 @@ class ProcessOptions:
     preview_rows: int = 50
 
 
-def _parse_brl(s: str) -> Optional[float]:
-    s = s.strip().replace("R$", "").strip()
-    if not s:
-        return None
-    if "." in s and "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _format_date(s: str) -> str:
-    if s and "-" in s:
-        part = s.split(" ")[0]
-        d, m, y = part.split("-")
-        return f"{d}/{m}/{y}"
-    return s
-
-
 def _parse_source_date(s: str) -> Optional[dt.date]:
     try:
         part = s.split(" ")[0]
@@ -64,6 +44,23 @@ def _parse_source_date(s: str) -> Optional[dt.date]:
         return dt.date(int(y), int(m), int(d))
     except Exception:
         return None
+
+
+def _read_with_pandas(content: str) -> tuple[pd.DataFrame, int]:
+    """Lê o CSV com o parser C do pandas (rápido). Retorna (df, linhas_puladas)."""
+    buf = io.StringIO(content)
+    df = pd.read_csv(
+        buf,
+        dtype=str,
+        keep_default_na=False,
+        on_bad_lines="skip",
+        engine="c",
+        low_memory=False,
+    )
+    # Conta linhas puladas (on_bad_lines='skip') comparando com contagem rápida
+    total_data_lines = content.count("\n") - 1  # -1 pelo header
+    linhas_puladas = max(0, total_data_lines - len(df))
+    return df, linhas_puladas
 
 
 def process_csv_content(
@@ -81,118 +78,113 @@ def process_csv_content(
 
     content = content_bytes.decode(input_encoding, errors="replace")
 
+    # Detecta número de colunas via header
+    first_newline = content.index("\n") if "\n" in content else len(content)
     try:
         dialect = csv.Sniffer().sniff(content[:4096])
-        reader = csv.reader(io.StringIO(content), dialect=dialect)
+        header_fields = list(csv.reader([content[:first_newline]], dialect))[0]
     except Exception:
-        reader = csv.reader(io.StringIO(content))
+        header_fields = content[:first_newline].split(",")
 
-    try:
-        header = next(reader)
-    except StopIteration:
-        raise ValueError("CSV vazio.")
+    num_header_cols = len(header_fields)
+    if num_header_cols < 20:
+        raise ValueError(f"Layout inesperado: cabeçalho com {num_header_cols} colunas (esperado >= 20).")
 
-    if len(header) < 20:
-        raise ValueError(f"Layout inesperado: cabeçalho com {len(header)} colunas (esperado >= 20).")
+    num_cols = 21 if num_header_cols >= 21 else 20
 
-    num_cols = 21 if len(header) >= 21 else 20
-
-    # Índices conforme layout
+    # Mapeamento de índices conforme layout
     if num_cols >= 21:
-        i_status, i_date, i_type, i_amount = 17, 18, 19, 20
+        col_status, col_date, col_type, col_amount = header_fields[17], header_fields[18], header_fields[19], header_fields[20]
     else:
-        i_status, i_date, i_type, i_amount = 16, 17, 18, 19
+        col_status, col_date, col_type, col_amount = header_fields[16], header_fields[17], header_fields[18], header_fields[19]
 
-    # Buffers de saída
-    out_buf = io.BytesIO()
-    out_wrapper = io.TextIOWrapper(out_buf, encoding=output_encoding, errors="replace", newline="")
-    out_writer = csv.writer(out_wrapper, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
-    out_writer.writerow(["Data", "Valor", "Resumo da Transação"])
+    col_desc     = header_fields[2]
+    col_orig_name = header_fields[3]
+    col_orig_acc  = header_fields[7]
+    col_dest_name = header_fields[9]
+    col_dest_acc  = header_fields[13]
 
-    err_rows: list[list[str]] = []
-    preview: list[dict] = []
+    # Leitura principal com parser C do pandas
+    df, linhas_nao_corrigidas = _read_with_pandas(content)
+    total_rows = len(df) + linhas_nao_corrigidas
 
-    total_rows = 0
-    linhas_problema = 0
-    linhas_nao_corrigidas = 0
-    linhas_exportadas = 0
-    soma_valor = 0.0
-    soma_valor_ok = 0
+    _empty = {
+        "output_bytes": b"",
+        "errors_bytes": b"",
+        "detected_input_encoding": input_encoding,
+        "preview": [],
+        "metrics": {
+            "total_rows": total_rows,
+            "linhas_problema": linhas_nao_corrigidas,
+            "linhas_exportadas": 0,
+            "soma_valor": 0.0,
+            "soma_valor_ok": 0,
+        },
+        "warnings": {"linhas_nao_corrigidas": linhas_nao_corrigidas},
+    }
 
-    for raw in reader:
-        total_rows += 1
+    if df.empty:
+        return _empty
 
-        if len(raw) != num_cols:
-            linhas_problema += 1
-            fixed = fix_row(raw, num_cols)
-            if len(fixed) != num_cols:
-                linhas_nao_corrigidas += 1
-                err_rows.append([f"Nao foi possivel corrigir para {num_cols} colunas", ",".join(raw)])
-                continue
-            raw = fixed
+    # Filtro por status
+    if options.statuses is not None:
+        df = df[df[col_status].str.strip().isin(options.statuses)]
 
-        # Filtro por status
-        if options.statuses is not None and raw[i_status].strip() not in options.statuses:
-            continue
+    # Filtro por data
+    if (options.date_start or options.date_end) and not df.empty:
+        dates = df[col_date].apply(_parse_source_date)
+        if options.date_start:
+            df = df[dates.apply(lambda d: d is not None and d >= options.date_start)]
+        if options.date_end:
+            df = df[dates.apply(lambda d: d is not None and d <= options.date_end)]
 
-        # Filtro por data
-        if options.date_start or options.date_end:
-            d = _parse_source_date(raw[i_date])
-            if options.date_start and (d is None or d < options.date_start):
-                continue
-            if options.date_end and (d is None or d > options.date_end):
-                continue
+    if df.empty:
+        return _empty
 
-        date_str = _format_date(raw[i_date])
-        valor_str = raw[i_amount].strip()
-        desc = raw[2].strip().upper()
-        tipo = raw[i_type].strip().upper()
-        origin_name = raw[3].strip().upper()
-        origin_acc = raw[7].strip()
-        dest_name = raw[9].strip().upper()
-        dest_acc = raw[13].strip()
+    # Geração de colunas de saída — tudo vetorizado
+    data_col   = df[col_date].str[:10].str.replace("-", "/", regex=False)
+    valor_col  = df[col_amount].fillna("").str.strip()
+    desc       = df[col_desc].fillna("").str.strip().str.upper()
+    tipo       = df[col_type].fillna("").str.strip().str.upper()
+    orig_name  = df[col_orig_name].fillna("").str.strip().str.upper()
+    orig_acc   = df[col_orig_acc].fillna("").str.strip()
+    dest_name  = df[col_dest_name].fillna("").str.strip().str.upper()
+    dest_acc   = df[col_dest_acc].fillna("").str.strip()
 
-        resumo = (
-            f"{desc} - TIPO: {tipo} DE R$ {valor_str}"
-            f" ORIGEM: {origin_name} (CONTA: {origin_acc})"
-            f" P/ DESTINO: {dest_name} (CONTA: {dest_acc})"
-        )
+    resumo = (
+        desc + " - TIPO: " + tipo + " DE R$ " + valor_col
+        + " ORIGEM: " + orig_name + " (CONTA: " + orig_acc + ")"
+        + " P/ DESTINO: " + dest_name + " (CONTA: " + dest_acc + ")"
+    )
 
-        out_writer.writerow([date_str, valor_str, resumo])
-        linhas_exportadas += 1
+    df_out = pd.DataFrame({"Data": data_col.values, "Valor": valor_col.values, "Resumo da Transação": resumo.values})
 
-        v = _parse_brl(valor_str)
-        if v is not None:
-            soma_valor += v
-            soma_valor_ok += 1
+    linhas_exportadas = len(df_out)
 
-        if len(preview) < options.preview_rows:
-            preview.append({"Data": date_str, "Valor": valor_str, "Resumo da Transação": resumo})
+    numeric = pd.to_numeric(
+        valor_col.str.replace(r"R\$\s*", "", regex=True)
+                 .str.replace(r"\.(?=\d{3})", "", regex=True)
+                 .str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    soma_valor = round(float(numeric.sum(skipna=True)), 2)
+    soma_valor_ok = int(numeric.notna().sum())
 
-    out_wrapper.flush()
-    output_bytes = out_buf.getvalue()
+    csv_str = df_out.to_csv(index=False, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+    output_bytes = csv_str.encode(output_encoding, errors="replace")
 
-    errors_bytes = b""
-    if err_rows:
-        ebuf = io.BytesIO()
-        ewrapper = io.TextIOWrapper(ebuf, encoding=output_encoding, errors="replace", newline="")
-        ewriter = csv.writer(ewrapper, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
-        ewriter.writerow(["Motivo", "LinhaOriginal"])
-        for row in err_rows:
-            ewriter.writerow(row)
-        ewrapper.flush()
-        errors_bytes = ebuf.getvalue()
+    preview = df_out.head(options.preview_rows).to_dict(orient="records")
 
     return {
         "output_bytes": output_bytes,
-        "errors_bytes": errors_bytes,
+        "errors_bytes": b"",
         "detected_input_encoding": input_encoding,
         "preview": preview,
         "metrics": {
             "total_rows": total_rows,
-            "linhas_problema": linhas_problema,
+            "linhas_problema": linhas_nao_corrigidas,
             "linhas_exportadas": linhas_exportadas,
-            "soma_valor": round(soma_valor, 2),
+            "soma_valor": soma_valor,
             "soma_valor_ok": soma_valor_ok,
         },
         "warnings": {"linhas_nao_corrigidas": linhas_nao_corrigidas},
