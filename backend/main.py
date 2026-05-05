@@ -14,8 +14,8 @@ from processors.ip_processor import process_csv_content, ProcessOptions
 
 app = FastAPI(title="Contabil Along Hub API", version="2.0.0")
 
-MAX_CSV_SIZE  = 10 * 1024 * 1024  # 10 MB
-MAX_XLSX_SIZE = 20 * 1024 * 1024  # 20 MB
+MAX_CSV_SIZE  = 100 * 1024 * 1024  # 100 MB
+MAX_XLSX_SIZE = 100 * 1024 * 1024  # 100 MB
 
 # Defina ALLOWED_ORIGIN no Render com a URL do Vercel para restringir acesso
 _raw_origins = os.getenv("ALLOWED_ORIGIN", "*")
@@ -47,7 +47,7 @@ async def process_ip(files: list[UploadFile] = File(...)):
     for uf, content in zip(csv_files, contents):
         if len(content) > MAX_CSV_SIZE:
             safe = pathlib.Path(uf.filename).name
-            raise HTTPException(status_code=413, detail=f"Arquivo '{safe}' excede o limite de 10 MB.")
+            raise HTTPException(status_code=413, detail=f"Arquivo '{safe}' excede o limite de 100 MB.")
 
     async def _process_one(content_bytes: bytes, filename: str) -> dict:
         safe_name = pathlib.Path(filename).name
@@ -97,7 +97,7 @@ async def process_genial(file: UploadFile = File(...)):
     content_bytes = await file.read()
 
     if len(content_bytes) > MAX_XLSX_SIZE:
-        raise HTTPException(status_code=413, detail="Arquivo excede o limite de 20 MB.")
+        raise HTTPException(status_code=413, detail="Arquivo excede o limite de 100 MB.")
 
     safe_name = pathlib.Path(file.filename).name
     targets = GenialTargets().all
