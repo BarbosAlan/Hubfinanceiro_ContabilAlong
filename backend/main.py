@@ -7,6 +7,7 @@ import zipfile
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from processors.genial_processor import process_genial_excel, format_genial_excel, GenialTargets
@@ -21,6 +22,7 @@ MAX_XLSX_SIZE = 100 * 1024 * 1024  # 100 MB
 _raw_origins = os.getenv("ALLOWED_ORIGIN", "*")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")]
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
