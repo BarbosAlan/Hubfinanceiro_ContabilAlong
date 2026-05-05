@@ -66,8 +66,8 @@ async def process_ip(files: list[UploadFile] = File(...)):
                 "warnings": result["warnings"],
                 "preview": result["preview"],
             }
-        except Exception:
-            return {"_error": True, "filename": safe_name, "error": "Erro ao processar arquivo."}
+        except Exception as e:
+            return {"_error": True, "filename": safe_name, "error": f"Erro interno: {str(e)}"}
 
     raw = await asyncio.gather(*[_process_one(c, f.filename) for f, c in zip(csv_files, contents)])
 
@@ -75,7 +75,8 @@ async def process_ip(files: list[UploadFile] = File(...)):
     errors  = [{"filename": r["filename"], "error": r["error"]} for r in raw if r.get("_error")]
 
     if not results and errors:
-        raise HTTPException(status_code=400, detail="Nenhum arquivo processado com sucesso.")
+        error_details = "; ".join([e["error"] for e in errors])
+        raise HTTPException(status_code=400, detail=f"Nenhum arquivo processado com sucesso. Detalhes: {error_details}")
 
     all_zip_base64 = None
     if len(results) > 1:

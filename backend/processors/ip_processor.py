@@ -1,5 +1,8 @@
 import csv
 import io
+import sys
+
+csv.field_size_limit(sys.maxsize)
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional
@@ -75,7 +78,12 @@ def process_csv_content(
         input_encoding = detect_encoding(content_bytes)
 
     content = content_bytes.decode(input_encoding, errors="replace")
-    reader = csv.reader(io.StringIO(content))
+    
+    try:
+        dialect = csv.Sniffer().sniff(content[:4096])
+        reader = csv.reader(io.StringIO(content), dialect=dialect)
+    except Exception:
+        reader = csv.reader(io.StringIO(content))
 
     try:
         header = next(reader)
