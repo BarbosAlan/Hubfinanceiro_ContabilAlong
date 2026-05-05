@@ -10,13 +10,14 @@ from typing import Optional
 import pandas as pd
 
 
-def fix_row(r: list[str]) -> list[str]:
+def fix_row(r: list[str], expected: int = 21) -> list[str]:
     """Corrige linhas onde DestinationName contém vírgulas e foi quebrado em múltiplas colunas."""
-    if len(r) == 21:
+    if len(r) == expected:
         return r
+    suffix_len = expected - 10
     prefix = r[:9]
-    suffix = r[-11:]
-    dest_name = ",".join(r[9 : len(r) - 11])
+    suffix = r[-suffix_len:]
+    dest_name = ",".join(r[9 : len(r) - suffix_len])
     return prefix + [dest_name] + suffix
 
 
@@ -90,8 +91,10 @@ def process_csv_content(
     except StopIteration:
         raise ValueError("CSV vazio.")
 
-    if len(header) < 21:
-        raise ValueError(f"Layout inesperado: cabeçalho com {len(header)} colunas (esperado >= 21).")
+    if len(header) < 20:
+        raise ValueError(f"Layout inesperado: cabeçalho com {len(header)} colunas (esperado >= 20).")
+
+    num_cols = 21 if len(header) >= 21 else 20
 
     rows: list[list[str]] = []
     error_rows: list[list[str]] = []
@@ -99,12 +102,12 @@ def process_csv_content(
     linhas_nao_corrigidas = 0
 
     for raw in reader:
-        if len(raw) != 21:
+        if len(raw) != num_cols:
             linhas_problema += 1
-            fixed = fix_row(raw)
-            if len(fixed) != 21:
+            fixed = fix_row(raw, num_cols)
+            if len(fixed) != num_cols:
                 linhas_nao_corrigidas += 1
-                error_rows.append(["Nao foi possivel corrigir para 21 colunas", ",".join(raw)])
+                error_rows.append([f"Nao foi possivel corrigir para {num_cols} colunas", ",".join(raw)])
                 continue
             rows.append(fixed)
         else:
@@ -130,16 +133,22 @@ def process_csv_content(
     if not rows:
         return _empty_result
 
-    col = [f"c{i}" for i in range(21)]
+    col = [f"c{i}" for i in range(num_cols)]
     df = pd.DataFrame(rows, columns=col)
 
-    # Filtro por status (coluna 17)
-    if options.statuses is not None:
-        df = df[df["c17"].str.strip().isin(options.statuses)]
+    # Mapeamento de colunas conforme layout (20 ou 21 colunas)
+    if num_cols >= 21:
+        c_status, c_date, c_type, c_amount = "c17", "c18", "c19", "c20"
+    else:
+        c_status, c_date, c_type, c_amount = "c16", "c17", "c18", "c19"
 
-    # Filtro por data (coluna 18)
+    # Filtro por status
+    if options.statuses is not None:
+        df = df[df[c_status].str.strip().isin(options.statuses)]
+
+    # Filtro por data
     if (options.date_start or options.date_end) and not df.empty:
-        dates = df["c18"].apply(_parse_source_date)
+        dates = df[c_date].apply(_parse_source_date)
         if options.date_start:
             df = df[dates.apply(lambda d: d is not None and d >= options.date_start)]
         if options.date_end:
@@ -149,12 +158,12 @@ def process_csv_content(
         return _empty_result
 
     # Colunas de saída
-    data_col = df["c18"].apply(_format_date)
-    valor_col = df["c20"].fillna("")
+    data_col = df[c_date].apply(_format_date)
+    valor_col = df[c_amount].fillna("")
 
     # Resumo vetorizado
     desc = df["c2"].fillna("").str.upper()
-    tipo = df["c19"].fillna("").str.upper()
+    tipo = df[c_type].fillna("").str.upper()
     origin_name = df["c3"].fillna("").str.upper()
     origin_acc = df["c7"].fillna("")
     dest_name = df["c9"].fillna("").str.upper()
