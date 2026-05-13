@@ -1,6 +1,6 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import axios from 'axios';
-import { Upload, FileCheck, AlertCircle, Download, FileJson, Table as TableIcon, Trash2 } from 'lucide-react';
+import { Upload, FileCheck, AlertCircle, Download, FileJson, Trash2, Loader2 } from 'lucide-react';
 import { API_URL } from '../config';
 
 interface FileMetrics {
@@ -12,14 +12,19 @@ interface FileMetrics {
   soma_valor_ok: number;
 }
 
+const POLL_INTERVAL_MS = 3000;
+const POLL_TIMEOUT_MS  = 600_000; // 10 min
+
 const ImportacaoIP: React.FC = () => {
-  const [files, setFiles] = useState<File[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState<FileMetrics[]>([]);
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [files, setFiles]           = useState<File[]>([]);
+  const [loading, setLoading]       = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState('PROCESSANDO...');
+  const [results, setResults]       = useState<FileMetrics[]>([]);
+  const [downloadUrl, setDownloadUrl]   = useState<string | null>(null);
   const [downloadName, setDownloadName] = useState<string>('tratados');
-  const [error, setError] = useState<string | null>(null);
-  const [dragging, setDragging] = useState(false);
+  const [error, setError]           = useState<string | null>(null);
+  const [dragging, setDragging]     = useState(false);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) setFiles(Array.from(e.target.files));
@@ -36,54 +41,62 @@ const ImportacaoIP: React.FC = () => {
     if (files.length === 0) return;
 
     setLoading(true);
+    setLoadingMsg('ENVIANDO...');
     setError(null);
-
-    // Revoga URL anterior para liberar memória
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     setDownloadUrl(null);
-
-    const formData = new FormData();
-    files.forEach(f => formData.append('files', f));
+    setResults([]);
 
     try {
-      const response = await axios.post(`${API_URL}/api/ip/process`, formData, {
+      // 1. Enviar arquivos e obter job_id
+      const formData = new FormData();
+      files.forEach(f => formData.append('files', f));
+
+      const { data: jobData } = await axios.post(`${API_URL}/api/ip/process`, formData);
+      const jobId: string = jobData.job_id;
+
+      setLoadingMsg('PROCESSANDO...');
+
+      // 2. Fazer polling até o job terminar
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + POLL_TIMEOUT_MS;
+
+        const poll = async () => {
+          try {
+            const { data } = await axios.get(`${API_URL}/api/ip/status/${jobId}`);
+            if (data.status === 'done') return resolve();
+            if (data.status === 'error') return reject(new Error(data.detail || 'Erro no processamento.'));
+          } catch (e: any) {
+            return reject(new Error(e.response?.data?.detail || 'Erro ao verificar status.'));
+          }
+          if (Date.now() > deadline) return reject(new Error('Tempo esgotado.'));
+          pollTimer.current = setTimeout(poll, POLL_INTERVAL_MS);
+        };
+
+        poll();
+      });
+
+      setLoadingMsg('BAIXANDO...');
+
+      // 3. Baixar resultado
+      const response = await axios.get(`${API_URL}/api/ip/download/${jobId}`, {
         responseType: 'blob',
       });
 
-      // Extrai métricas dos headers
-      const single = response.headers['x-metrics'];
-      const multi  = response.headers['x-all-metrics'];
+      const metricsHeader = response.headers['x-all-metrics'];
+      if (metricsHeader) setResults(JSON.parse(metricsHeader));
 
-      let metrics: FileMetrics[] = [];
-      if (single) {
-        const m = JSON.parse(single);
-        metrics = [{ name: files[0].name, ...m }];
-      } else if (multi) {
-        metrics = JSON.parse(multi);
-      }
-      setResults(metrics);
-
-      // Cria URL de download do blob binário
       const blob = new Blob([response.data], { type: response.headers['content-type'] });
-      const url  = URL.createObjectURL(blob);
-      setDownloadUrl(url);
+      setDownloadUrl(URL.createObjectURL(blob));
 
       const disposition: string = response.headers['content-disposition'] ?? '';
       const match = disposition.match(/filename="?([^"]+)"?/);
       setDownloadName(match ? match[1] : files.length > 1 ? 'tratados.zip' : `tratado_${files[0].name}`);
 
     } catch (err: any) {
-      // Erros com responseType blob chegam como blob — precisa ler como texto
-      if (err.response?.data instanceof Blob) {
-        const text = await err.response.data.text();
-        try {
-          setError(JSON.parse(text)?.detail || 'Erro ao processar arquivos.');
-        } catch {
-          setError('Erro ao processar arquivos.');
-        }
-      } else {
-        setError(err.response?.data?.detail || 'Erro ao processar arquivos.');
-      }
+      if (pollTimer.current) clearTimeout(pollTimer.current);
+      const msg = err.response?.data?.detail ?? err.message ?? 'Erro ao processar arquivos.';
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -107,7 +120,7 @@ const ImportacaoIP: React.FC = () => {
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Upload Section */}
+        {/* Upload */}
         <div className="lg:col-span-1 space-y-6">
           <div className="bg-surface p-6 rounded-2xl border border-outline-variant shadow-sm">
             <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2">
@@ -135,19 +148,21 @@ const ImportacaoIP: React.FC = () => {
                   <button onClick={() => { setFiles([]); setResults([]); setDownloadUrl(null); }} className="text-red-400 hover:text-red-600"><Trash2 size={14}/></button>
                 </div>
                 {files.map((f, i) => (
-                  <div key={i} className="flex items-center gap-2 bg-surface-container-low p-2 rounded-lg text-xs font-bold text-primary truncate">
+                  <div key={i} className="flex items-center gap-2 bg-surface-container-low p-2 rounded-lg text-xs font-bold text-primary">
                     <FileCheck size={14} className="text-green-500 flex-shrink-0" />
-                    <span className="truncate">{f.name}</span>
+                    <span className="truncate flex-1">{f.name}</span>
                     <span className="text-slate-400 flex-shrink-0">{(f.size / 1024 / 1024).toFixed(1)} MB</span>
                   </div>
                 ))}
 
                 <button
                   onClick={processFiles}
-                  disabled={loading || files.length === 0}
+                  disabled={loading}
                   className="w-full mt-4 bg-secondary hover:bg-primary-container text-white font-black py-4 rounded-xl transition-all shadow-lg shadow-secondary/20 flex items-center justify-center gap-2 disabled:opacity-50 disabled:grayscale"
                 >
-                  {loading ? 'PROCESSANDO...' : 'PROCESSAR ARQUIVOS'}
+                  {loading
+                    ? <><Loader2 size={16} className="animate-spin" />{loadingMsg}</>
+                    : 'PROCESSAR ARQUIVOS'}
                 </button>
               </div>
             )}
@@ -155,22 +170,23 @@ const ImportacaoIP: React.FC = () => {
 
           {error && (
             <div className="bg-red-50 border border-red-100 p-4 rounded-xl flex gap-3 text-red-600">
-              <AlertCircle className="flex-shrink-0" />
+              <AlertCircle className="flex-shrink-0" size={18} />
               <p className="text-xs font-bold leading-relaxed">{error}</p>
             </div>
           )}
         </div>
 
-        {/* Results Section */}
+        {/* Resultados */}
         <div className="lg:col-span-2">
           {results.length > 0 && downloadUrl ? (
             <div className="space-y-6">
-              {/* Download banner */}
               <div className="flex items-center justify-between bg-primary p-5 rounded-2xl text-white shadow-lg shadow-primary/20">
                 <div>
-                  <p className="text-xs font-black uppercase tracking-widest">{results.length} arquivo{results.length > 1 ? 's' : ''} processado{results.length > 1 ? 's' : ''}</p>
+                  <p className="text-xs font-black uppercase tracking-widest">
+                    {results.length} arquivo{results.length > 1 ? 's' : ''} processado{results.length > 1 ? 's' : ''}
+                  </p>
                   <p className="text-[10px] text-white/50 mt-0.5">
-                    {totalExportadas.toLocaleString('pt-BR')} linhas · R$ {Math.abs(totalValor).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                    {totalExportadas.toLocaleString('pt-BR')} linhas exportadas
                   </p>
                 </div>
                 <a
@@ -182,7 +198,6 @@ const ImportacaoIP: React.FC = () => {
                 </a>
               </div>
 
-              {/* Per-file metrics */}
               {results.map((res, i) => (
                 <div key={i} className="bg-surface rounded-2xl border border-outline-variant shadow-lg overflow-hidden animate-in zoom-in-95 duration-300">
                   <div className="bg-surface-container-low px-6 py-4 flex items-center gap-3 border-b border-outline-variant">
@@ -191,25 +206,22 @@ const ImportacaoIP: React.FC = () => {
                     </div>
                     <h4 className="font-black text-primary text-sm truncate">{res.name}</h4>
                   </div>
-
-                  <div className="p-6">
-                    <div className="grid grid-cols-4 gap-4">
-                      <div className="p-4 bg-background rounded-xl border border-outline-variant">
-                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Linhas Totais</p>
-                        <p className="text-lg font-black text-primary mt-1">{res.total_rows.toLocaleString('pt-BR')}</p>
-                      </div>
-                      <div className="p-4 bg-background rounded-xl border border-outline-variant">
-                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Exportadas</p>
-                        <p className="text-lg font-black text-secondary mt-1">{res.linhas_exportadas.toLocaleString('pt-BR')}</p>
-                      </div>
-                      <div className="p-4 bg-background rounded-xl border border-outline-variant">
-                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Ignoradas</p>
-                        <p className="text-lg font-black text-slate-500 mt-1">{(res.total_rows - res.linhas_exportadas).toLocaleString('pt-BR')}</p>
-                      </div>
-                      <div className="p-4 bg-background rounded-xl border border-outline-variant">
-                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Valor Consolidado</p>
-                        <p className="text-lg font-black text-primary mt-1">R$ {res.soma_valor.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
-                      </div>
+                  <div className="p-6 grid grid-cols-4 gap-4">
+                    <div className="p-4 bg-background rounded-xl border border-outline-variant">
+                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Linhas Totais</p>
+                      <p className="text-lg font-black text-primary mt-1">{res.total_rows.toLocaleString('pt-BR')}</p>
+                    </div>
+                    <div className="p-4 bg-background rounded-xl border border-outline-variant">
+                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Exportadas</p>
+                      <p className="text-lg font-black text-secondary mt-1">{res.linhas_exportadas.toLocaleString('pt-BR')}</p>
+                    </div>
+                    <div className="p-4 bg-background rounded-xl border border-outline-variant">
+                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Ignoradas</p>
+                      <p className="text-lg font-black text-slate-500 mt-1">{(res.total_rows - res.linhas_exportadas).toLocaleString('pt-BR')}</p>
+                    </div>
+                    <div className="p-4 bg-background rounded-xl border border-outline-variant">
+                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Valor Total</p>
+                      <p className="text-lg font-black text-primary mt-1">R$ {res.soma_valor.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
                     </div>
                   </div>
                 </div>
@@ -217,10 +229,20 @@ const ImportacaoIP: React.FC = () => {
             </div>
           ) : (
             <div className="h-[400px] bg-surface-container-low/30 border-2 border-dashed border-outline-variant rounded-2xl flex flex-col items-center justify-center text-slate-400 italic">
-              <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center mb-4 shadow-sm">
-                <FileJson size={24} className="opacity-20" />
-              </div>
-              <p className="text-xs font-bold uppercase tracking-widest opacity-50">Nenhum resultado processado ainda</p>
+              {loading ? (
+                <div className="flex flex-col items-center gap-4">
+                  <Loader2 size={32} className="animate-spin text-secondary" />
+                  <p className="text-xs font-bold uppercase tracking-widest opacity-70">{loadingMsg}</p>
+                  <p className="text-[10px] opacity-40">Arquivos grandes podem levar alguns minutos</p>
+                </div>
+              ) : (
+                <>
+                  <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center mb-4 shadow-sm">
+                    <FileJson size={24} className="opacity-20" />
+                  </div>
+                  <p className="text-xs font-bold uppercase tracking-widest opacity-50">Nenhum resultado processado ainda</p>
+                </>
+              )}
             </div>
           )}
         </div>

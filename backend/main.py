@@ -5,6 +5,8 @@ import io
 import json
 import os
 import pathlib
+import time
+import uuid
 import zipfile
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -19,6 +21,7 @@ app = FastAPI(title="Contabil Along Hub API", version="2.0.0")
 
 MAX_CSV_SIZE  = 500 * 1024 * 1024  # 500 MB
 MAX_XLSX_SIZE = 100 * 1024 * 1024  # 100 MB
+JOB_TTL_S     = 600                # jobs expiram após 10 min
 
 _raw_origins = os.getenv("ALLOWED_ORIGIN", "*")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")]
@@ -33,6 +36,68 @@ app.add_middleware(
     expose_headers=["X-Metrics", "X-All-Metrics", "Content-Disposition"],
 )
 
+# Armazenamento em memória dos jobs de processamento IP
+_jobs: dict[str, dict] = {}
+
+
+def _cleanup_expired_jobs() -> None:
+    now = time.time()
+    expired = [jid for jid, j in _jobs.items() if now - j.get("created_at", now) > JOB_TTL_S]
+    for jid in expired:
+        _jobs.pop(jid, None)
+
+
+async def _run_ip_job(job_id: str, files: list[tuple[str, bytes]]) -> None:
+    """Processa os arquivos em background e armazena o resultado no job."""
+    try:
+        async def _one(name: str, content: bytes) -> dict:
+            result = await asyncio.to_thread(
+                process_csv_content,
+                content,
+                input_encoding=None,
+                options=ProcessOptions(statuses={"Completed"}, preview_rows=10),
+            )
+            return {"name": name, **result}
+
+        results = await asyncio.gather(*[_one(n, c) for n, c in files])
+        ok      = [r for r in results if "output_bytes" in r]
+
+        if not ok:
+            _jobs[job_id] = {"status": "error", "error": "Nenhum arquivo processado com sucesso.",
+                             "created_at": _jobs[job_id]["created_at"]}
+            return
+
+        if len(ok) == 1:
+            r = ok[0]
+            compressed = await asyncio.to_thread(gzip.compress, r["output_bytes"], 1)
+            _jobs[job_id] = {
+                "status": "done",
+                "content": compressed,
+                "media_type": "text/csv; charset=latin-1",
+                "content_encoding": "gzip",
+                "filename": f"tratado_{r['name']}",
+                "metrics": [{"name": r["name"], **r["metrics"]}],
+                "created_at": _jobs[job_id]["created_at"],
+            }
+        else:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                for r in ok:
+                    zf.writestr(f"tratado_{r['name']}", r["output_bytes"])
+            zip_buf.seek(0)
+            _jobs[job_id] = {
+                "status": "done",
+                "content": zip_buf.read(),
+                "media_type": "application/zip",
+                "content_encoding": None,
+                "filename": "tratados.zip",
+                "metrics": [{"name": r["name"], **r["metrics"]} for r in ok],
+                "created_at": _jobs[job_id]["created_at"],
+            }
+    except Exception as e:
+        _jobs[job_id] = {"status": "error", "error": str(e),
+                         "created_at": _jobs[job_id].get("created_at", time.time())}
+
 
 @app.get("/")
 def health_check():
@@ -41,8 +106,9 @@ def health_check():
 
 @app.post("/api/ip/process")
 async def process_ip(files: list[UploadFile] = File(...)):
-    csv_files = [f for f in files if f.filename and f.filename.endswith(".csv")]
+    _cleanup_expired_jobs()
 
+    csv_files = [f for f in files if f.filename and f.filename.endswith(".csv")]
     if not csv_files:
         raise HTTPException(status_code=400, detail="Nenhum arquivo .csv enviado.")
 
@@ -53,59 +119,42 @@ async def process_ip(files: list[UploadFile] = File(...)):
             safe = pathlib.Path(uf.filename).name
             raise HTTPException(status_code=413, detail=f"Arquivo '{safe}' excede o limite de 500 MB.")
 
-    async def _process_one(content_bytes: bytes, filename: str) -> dict:
-        safe_name = pathlib.Path(filename).name
-        try:
-            result = await asyncio.to_thread(
-                process_csv_content,
-                content_bytes,
-                input_encoding=None,
-                options=ProcessOptions(statuses={"Completed"}, preview_rows=10),
-            )
-            return {"_ok": True, "name": safe_name, **result}
-        except Exception as e:
-            return {"_ok": False, "name": safe_name, "error": str(e)}
+    job_id = uuid.uuid4().hex[:12]
+    named_files = [(pathlib.Path(f.filename).name, c) for f, c in zip(csv_files, contents)]
 
-    raw = await asyncio.gather(*[_process_one(c, f.filename) for f, c in zip(csv_files, contents)])
+    _jobs[job_id] = {"status": "processing", "created_at": time.time()}
+    asyncio.create_task(_run_ip_job(job_id, named_files))
 
-    ok      = [r for r in raw if r["_ok"]]
-    failed  = [r for r in raw if not r["_ok"]]
+    return JSONResponse({"job_id": job_id})
 
-    if not ok:
-        detail = "; ".join(f"{r['name']}: {r['error']}" for r in failed)
-        raise HTTPException(status_code=400, detail=f"Nenhum arquivo processado. Detalhes: {detail}")
 
-    # Resposta binária com gzip pré-comprimido (o GZipMiddleware ignora responses
-    # que já têm Content-Encoding setado, então não bufferiza tudo de novo).
-    if len(ok) == 1:
-        r = ok[0]
-        compressed = gzip.compress(r["output_bytes"], compresslevel=1)
-        metrics_header = json.dumps(r["metrics"])
-        return Response(
-            content=compressed,
-            media_type="text/csv; charset=latin-1",
-            headers={
-                "Content-Encoding": "gzip",
-                "Content-Disposition": f'attachment; filename="tratado_{r["name"]}"',
-                "X-Metrics": metrics_header,
-            },
-        )
+@app.get("/api/ip/status/{job_id}")
+async def ip_job_status(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado ou expirado.")
+    if job["status"] == "error":
+        raise HTTPException(status_code=400, detail=job["error"])
+    return {"status": job["status"]}
 
-    # Múltiplos arquivos — ZIP com todos os CSVs
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        for r in ok:
-            zf.writestr(f"tratado_{r['name']}", r["output_bytes"])
-    zip_buf.seek(0)
 
-    all_metrics = [{"name": r["name"], **r["metrics"]} for r in ok]
+@app.get("/api/ip/download/{job_id}")
+async def ip_job_download(job_id: str):
+    job = _jobs.pop(job_id, None)  # consome o job (libera memória)
+    if not job or job["status"] != "done":
+        raise HTTPException(status_code=404, detail="Resultado não disponível.")
+
+    headers: dict[str, str] = {
+        "Content-Disposition": f'attachment; filename="{job["filename"]}"',
+        "X-All-Metrics": json.dumps(job["metrics"]),
+    }
+    if job.get("content_encoding"):
+        headers["Content-Encoding"] = job["content_encoding"]
+
     return Response(
-        content=zip_buf.read(),
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": 'attachment; filename="tratados.zip"',
-            "X-All-Metrics": json.dumps(all_metrics),
-        },
+        content=job["content"],
+        media_type=job["media_type"],
+        headers=headers,
     )
 
 

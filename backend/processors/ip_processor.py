@@ -35,7 +35,7 @@ def _parse_source_date(s: str) -> Optional[dt.date]:
         return None
 
 
-_Q = '"'  # aspas usadas na montagem do CSV de saída
+_Q = '"'
 
 
 def process_csv_content(
@@ -51,7 +51,6 @@ def process_csv_content(
     if input_encoding is None:
         input_encoding = detect_encoding(content_bytes)
 
-    # Detecta dialeto/colunas nos primeiros bytes (sem decodificar o arquivo inteiro)
     sample = content_bytes[:8192].decode(input_encoding, errors="replace")
     first_newline = sample.index("\n") if "\n" in sample else len(sample)
     try:
@@ -77,7 +76,6 @@ def process_csv_content(
     col_dest_name = header_fields[9]
     col_dest_acc  = header_fields[13]
 
-    # Lê só as 9 colunas necessárias (de 20/21) — reduz memória e acelera parse
     usecols = [col_desc, col_orig_name, col_orig_acc, col_dest_name, col_dest_acc,
                col_status, col_date, col_type, col_amount]
 
@@ -101,7 +99,7 @@ def process_csv_content(
         low_memory=False,
         encoding=input_encoding,
         encoding_errors="replace",
-        chunksize=200_000,
+        chunksize=50_000,
         usecols=usecols,
     ):
         total_lidas += len(chunk)
@@ -127,14 +125,15 @@ def process_csv_content(
         orig_acc   = chunk[col_orig_acc].fillna("").str.strip()
         dest_name  = chunk[col_dest_name].fillna("").str.strip().str.upper()
         dest_acc   = chunk[col_dest_acc].fillna("").str.strip()
+        del chunk  # libera o DataFrame do chunk antes de construir as strings
 
         resumo = (
             desc + " - TIPO: " + tipo + " DE R$ " + valor_col
             + " ORIGEM: " + orig_name + " (CONTA: " + orig_acc + ")"
             + " P/ DESTINO: " + dest_name + " (CONTA: " + dest_acc + ")"
         )
+        del desc, tipo, orig_name, orig_acc, dest_name, dest_acc
 
-        # Escrita direta no buffer — mais rápido que df.to_csv(quoting=QUOTE_ALL)
         joined = _Q + data_col + _Q + "," + _Q + valor_col + _Q + "," + _Q + resumo + _Q
         out_buf.write(("\r\n".join(joined.values) + "\r\n").encode(output_encoding, errors="replace"))
 
@@ -153,6 +152,7 @@ def process_csv_content(
         )
         soma_valor    += float(numeric.sum(skipna=True))
         soma_valor_ok += int(numeric.notna().sum())
+        del joined, resumo, data_col, valor_col, numeric
 
     linhas_nao_corrigidas = max(0, total_data_lines - total_lidas)
     soma_valor = round(soma_valor, 2)
