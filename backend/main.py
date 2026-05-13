@@ -125,7 +125,7 @@ async def process_ip(files: list[UploadFile] = File(...)):
     _jobs[job_id] = {"status": "processing", "created_at": time.time()}
     asyncio.create_task(_run_ip_job(job_id, named_files))
 
-    return JSONResponse({"job_id": job_id})
+    return JSONResponse({"job_id": job_id, "results": [], "errors": [], "all_zip_base64": None})
 
 
 @app.get("/api/ip/status/{job_id}")
