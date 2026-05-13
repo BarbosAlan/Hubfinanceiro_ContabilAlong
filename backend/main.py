@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import gzip
 import io
+import json
 import os
 import pathlib
 import zipfile
@@ -8,17 +10,16 @@ import zipfile
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from processors.genial_processor import process_genial_excel, format_genial_excel, GenialTargets
 from processors.ip_processor import process_csv_content, ProcessOptions
 
 app = FastAPI(title="Contabil Along Hub API", version="2.0.0")
 
-MAX_CSV_SIZE  = 100 * 1024 * 1024  # 100 MB
+MAX_CSV_SIZE  = 500 * 1024 * 1024  # 500 MB
 MAX_XLSX_SIZE = 100 * 1024 * 1024  # 100 MB
 
-# Defina ALLOWED_ORIGIN no Render com a URL do Vercel para restringir acesso
 _raw_origins = os.getenv("ALLOWED_ORIGIN", "*")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")]
 
@@ -29,6 +30,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    expose_headers=["X-Metrics", "X-All-Metrics", "Content-Disposition"],
 )
 
 
@@ -49,7 +51,7 @@ async def process_ip(files: list[UploadFile] = File(...)):
     for uf, content in zip(csv_files, contents):
         if len(content) > MAX_CSV_SIZE:
             safe = pathlib.Path(uf.filename).name
-            raise HTTPException(status_code=413, detail=f"Arquivo '{safe}' excede o limite de 100 MB.")
+            raise HTTPException(status_code=413, detail=f"Arquivo '{safe}' excede o limite de 500 MB.")
 
     async def _process_one(content_bytes: bytes, filename: str) -> dict:
         safe_name = pathlib.Path(filename).name
@@ -58,38 +60,53 @@ async def process_ip(files: list[UploadFile] = File(...)):
                 process_csv_content,
                 content_bytes,
                 input_encoding=None,
-                options=ProcessOptions(statuses={"Completed"}, preview_rows=50),
+                options=ProcessOptions(statuses={"Completed"}, preview_rows=10),
             )
-            return {
-                "name": safe_name,
-                "output_base64": base64.b64encode(result["output_bytes"]).decode("utf-8"),
-                "errors_base64": base64.b64encode(result["errors_bytes"]).decode("utf-8") if result["errors_bytes"] else None,
-                "metrics": result["metrics"],
-                "warnings": result["warnings"],
-                "preview": result["preview"],
-            }
+            return {"_ok": True, "name": safe_name, **result}
         except Exception as e:
-            return {"_error": True, "filename": safe_name, "error": f"Erro interno: {str(e)}"}
+            return {"_ok": False, "name": safe_name, "error": str(e)}
 
     raw = await asyncio.gather(*[_process_one(c, f.filename) for f, c in zip(csv_files, contents)])
 
-    results = [r for r in raw if not r.get("_error")]
-    errors  = [{"filename": r["filename"], "error": r["error"]} for r in raw if r.get("_error")]
+    ok      = [r for r in raw if r["_ok"]]
+    failed  = [r for r in raw if not r["_ok"]]
 
-    if not results and errors:
-        error_details = "; ".join([e["error"] for e in errors])
-        raise HTTPException(status_code=400, detail=f"Nenhum arquivo processado com sucesso. Detalhes: {error_details}")
+    if not ok:
+        detail = "; ".join(f"{r['name']}: {r['error']}" for r in failed)
+        raise HTTPException(status_code=400, detail=f"Nenhum arquivo processado. Detalhes: {detail}")
 
-    all_zip_base64 = None
-    if len(results) > 1:
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for r in results:
-                zf.writestr(f"tratado_{r['name']}", base64.b64decode(r["output_base64"]))
-        zip_buffer.seek(0)
-        all_zip_base64 = base64.b64encode(zip_buffer.read()).decode("utf-8")
+    # Resposta binária com gzip pré-comprimido (o GZipMiddleware ignora responses
+    # que já têm Content-Encoding setado, então não bufferiza tudo de novo).
+    if len(ok) == 1:
+        r = ok[0]
+        compressed = gzip.compress(r["output_bytes"], compresslevel=1)
+        metrics_header = json.dumps(r["metrics"])
+        return Response(
+            content=compressed,
+            media_type="text/csv; charset=latin-1",
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Disposition": f'attachment; filename="tratado_{r["name"]}"',
+                "X-Metrics": metrics_header,
+            },
+        )
 
-    return JSONResponse(content={"results": results, "errors": errors, "all_zip_base64": all_zip_base64})
+    # Múltiplos arquivos — ZIP com todos os CSVs
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for r in ok:
+            zf.writestr(f"tratado_{r['name']}", r["output_bytes"])
+    zip_buf.seek(0)
+
+    all_metrics = [{"name": r["name"], **r["metrics"]} for r in ok]
+    return Response(
+        content=zip_buf.read(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": 'attachment; filename="tratados.zip"',
+            "X-All-Metrics": json.dumps(all_metrics),
+        },
+    )
 
 
 @app.post("/api/genial/process")
