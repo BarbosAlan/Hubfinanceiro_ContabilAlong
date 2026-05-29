@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation, Outlet } from 'react-router-dom';
-import { Home as HomeIcon, FileText, CreditCard, ChevronRight } from 'lucide-react';
+import { Home as HomeIcon, FileText, CreditCard, ChevronRight, FileSpreadsheet } from 'lucide-react';
 
 const Layout: React.FC = () => {
   const location = useLocation();
@@ -9,6 +9,7 @@ const Layout: React.FC = () => {
     { path: '/', label: 'Início', icon: HomeIcon },
     { path: '/ip', label: 'Importação IP', icon: FileText },
     { path: '/genial', label: 'Extrato Genial', icon: CreditCard },
+    { path: '/excel-to-csv', label: 'Excel para CSV', icon: FileSpreadsheet },
   ];
 
   return (

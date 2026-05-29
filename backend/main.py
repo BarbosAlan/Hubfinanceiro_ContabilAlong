@@ -158,6 +158,38 @@ async def ip_job_download(job_id: str):
     )
 
 
+@app.post("/api/excel-to-csv/process")
+async def excel_to_csv(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Arquivo deve ser .xlsx")
+
+    content_bytes = await file.read()
+
+    if len(content_bytes) > MAX_XLSX_SIZE:
+        raise HTTPException(status_code=413, detail="Arquivo excede o limite de 100 MB.")
+
+    safe_name = pathlib.Path(file.filename).name
+
+    try:
+        import pandas as pd
+
+        df = await asyncio.to_thread(pd.read_excel, io.BytesIO(content_bytes), sheet_name=0)
+        csv_buf = io.StringIO()
+        df.to_csv(csv_buf, index=False, sep=",")
+        csv_bytes = csv_buf.getvalue().encode("utf-8-sig")
+
+        return JSONResponse(content={
+            "filename": safe_name.replace(".xlsx", ".csv"),
+            "output_base64": base64.b64encode(csv_bytes).decode("utf-8"),
+            "row_count": len(df),
+            "col_count": len(df.columns),
+        })
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro ao converter o arquivo.")
+
+
 @app.post("/api/genial/process")
 async def process_genial(file: UploadFile = File(...)):
     if not file.filename or not file.filename.endswith(".xlsx"):
